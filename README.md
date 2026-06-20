@@ -438,32 +438,306 @@ async def download(url, sess, sem):
 
 The last two methods tie all of the above code together.
 
-`predict_images` predicts the ImageNet categories for a list of `Pillow` formatted images and returns the results as a list of `ImageOutput` 
-- **Security**: Sensitive information, such as Docker Hub credentials, is securely managed using AWS SSM Parameter Store.
+`predict_images` predicts the ImageNet categories for a list of `Pillow` formatted images and returns the results as a list of `ImageOutput` objects. 
 
-## Getting Started
+The `process` function downloads images from a list of URLs, processes them and returns a response.
 
-To get started with the GrowthString Project, follow these steps:
+The `@app.post` annotation indicates that we want `FastAPI` to expose this function using HTTP and that the request and response structure is defined by `PredictRequest` and `PredictResponse` respectively. 
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/yourusername/growthstring.git
-   cd growthstring
-2. **Set Up Your Environment**:
+```python
+def predict_images(images):
+    """
+    Predicts the image's category and transforms the results into the output format.
 
-Ensure you have Python and Flask installed.
-Install Docker and configure it on your machine.
-Set up AWS CLI and configure your credentials.
+    :param images: The Pillow Images to predict.
 
-3.**Build and Run the Application**:
-
-    Build the Docker image:
-    docker build -t growthstring .
-    
-    Run the Docker container:
-    docker run -p 5000:5000 growthstring
-    
-4.**Access the Application**:
-Open your web browser and navigate to http://localhost:5000.
+    :return: The prediction results.
+    """
+    response = list()
+    results = app.state.model.predict(images, BATCH_SIZE)
+    for top_n in results:
+        category, name, score = top_n[0]
+        response.append(ImageOutput(category=category, name=name, score=score))
+    return response
 
 
+@app.post('/v1/predict', response_model=PredictResponse)
+async def process(req: PredictRequest):
+    """
+    Predicts the category of the images contained in the request.
+
+    :param req: The request object containing the image data to predict.
+
+    :return: The prediction results.
+    """
+    logger.info('Processing request.')
+    logger.debug(req.json())
+    logger.info('Downloading images.')
+    images = await retrieve_images(req.images)
+    logger.info('Performing prediction.')
+    results = predict_images(images)
+    logger.info('Transaction complete.')
+    return PredictResponse(images=results)
+```
+
+### Health Check
+
+We will also expose a `HTTP GET` endpoint that can be called by load balancers to check the health of the application.
+
+```python
+@app.get('/health')
+def test():
+    """
+    Can be called by load balancers as a health check.
+    """
+    return HealthCheck()
+```
+
+### Handler (Lambda)
+
+In order to use `FastAPI` on Lambda we need to wrap the `FastAPI` `app` object with `Mangum`. 
+
+```python
+handler = Mangum(app)
+```
+
+*Note: When deploying the application locally or on AWS Elastic Beanstalk, this handler will not be used.*
+
+### Server setup (Local development only)
+
+Finally we will add an embedded `uvicorn` server that will allow us to run the API from the commandline for testing purposes.
+
+```python
+if __name__ == '__main__':
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description='Runs the API locally.')
+    parser.add_argument('--port',
+                        help='The port to listen for requests on.',
+                        type=int,
+                        default=8080)
+    args = parser.parse_args()
+    configure_logging()
+    uvicorn.run(app, host='0.0.0.0', port=args.port)
+```
+
+### Run the API
+
+You can run the application locally by executing the command below:
+
+```bash
+python main.py
+```
+
+This runs the application on an embedded `uvicorn` server.
+
+## Lambda Deployment
+
+Deploying the API to Lambda has a number of benefits, such as:
+- No management of servers or the underlying infrastructure.
+- Easy to scale the number of API instances to handle fluctuations in traffic.
+
+However it also has a few drawbacks, in particular:
+- The first time the Lambda is called there will be a small delay due to the container starting up.
+- Only memory (and proportional CPU amount) can be adjusted to improve performance.
+- Timeout is limited to 29 seconds when using it with an API Gateway.
+- Docker images are limited to 10 GB (but this should be more than enough for most APIs).
+- Pricing is based on both request count and processing time, which can become expensive for large numbers of longer running processes.
+- Not suitable for applications that require local storage; Lambda only provides 512MB of additional storage in the `/tmp` directory.
+
+### Docker Image
+
+AWS provides a number of base images for programming languages supported by Lambda. 
+
+For this tutorial we are going to be using the Python 3.7 base image.
+
+*Note that the name of the handler matches the name of the `Mangum` handler defined in the source code.* 
+
+```bash
+FROM public.ecr.aws/lambda/python:3.7
+
+# Copy function code
+COPY main.py ${LAMBDA_TASK_ROOT}/app.py
+
+# Install the function's dependencies using file requirements.txt
+
+COPY requirements.txt  .
+RUN  pip3 install --no-cache-dir -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
+
+# Set the CMD to your handler (could also be done as a parameter override outside of the Dockerfile)
+CMD [ "app.handler" ]
+```
+
+Next we build and tag the Lambda image using the `docker build` command:
+
+```bash
+docker build -t imagenet-lambda -f Dockerfile.lambda .
+```
+
+After the command completes you should see output similar to below:
+
+```bash
+Step 5/5 : CMD [ "app.handler" ]
+ ---> Running in 2257d01b05b0
+Removing intermediate container 2257d01b05b0
+ ---> 14755a1c4440
+Successfully built 14755a1c4440
+Successfully tagged imagenet-lambda:latest
+```
+
+Before we can use the image in Lambda we also need to upload it to [AWS Elastic Container Registry (ECR)](https://aws.amazon.com/ecr/).
+
+First, navigate to the AWS ECR console and create a new repository. 
+
+Next log into the private ECR repository you just created, by replacing the `<Region Name>` and `<Account ID>` placeholders with the region of the ECR repository and the account number of your AWS account, and executing the command below:
+
+```bash
+aws ecr get-login-password --region <Region Name> | docker login --username AWS --password-stdin <Account ID>.dkr.ecr.<Region Name>.amazonaws.com
+```
+
+Note: to run the command above, the `awscli` package needs to have been installed. Installation instructions can be found [here](https://github.com/aws/aws-cli).
+
+
+Finally we will tag the image and push it (upload it) to ECR.
+
+```bash
+docker tag imagenet-lambda:latest <AccountID>.dkr.ecr.<Region>.amazonaws.com/<RepositoryName>:latest
+docker push  <AccountID>.dkr.ecr.<Region>.amazonaws.com/<RepositoryName>:latest
+```
+
+### CloudFormation
+
+Now that we have created the Docker image, the next step is to create the Lambda function that will use it. 
+
+To deploy the function I have prepared a CloudFormation template that creates a Lambda, an API Gateway, and sets up the permissions required to call the function.
+
+1. Go to: https://console.aws.amazon.com/cloudformation/home
+2. Select the region that you want to deploy to.
+3. Select 'Create Stack'->'With new resources (standard).'
+4. Select 'Upload template'.
+5. Enter the path to [deploy/lambda.yaml](deploy/lambda.yaml). Click next.
+6. Enter the required parameters for the template, in particular:
+   - Stack Name. The name of the stack. For example: 'ImageNetTest'. 
+   - ImageUri. The URI of Docker image uploaded in the previous step; In the format `<Account ID>.dkr.ecr.<Region>.amazonaws.com/<Repository Name>:latest`.
+7. Click next.
+8. At the bottom of the screen, check all of the check boxes. 
+9. Click 'Create Stack'. 
+
+The API has now been deployed and can be invoked by calling it through the API Gateway.
+
+## Elastic Beanstalk Deployment
+
+Similar to Lambda, deploying the API to Elastic Beanstalk also has a number of benefits, such as:
+- A lot more flexibility in configuration. For example, you can choose from a wide variety of instance types, including GPU instances.
+- No warmup time.
+- Cost is based on the time that an instance is running, rather than per a request. This maybe cheaper for some APIs.
+
+However it also has a few drawbacks, in particular:
+- Instance startup and scaling is slower.
+- You need to pay for the instance even if it is idle.
+- The increase in flexibility also makes it more complicated to use.
+
+### Docker Image
+
+Similar to Lambda we will create a `Dockerfile` to create a Docker image, but the contents are a little bit different.
+
+Instead of using `Mangum` and Lambda to call the handler directly we will deploy the application using [uvicorn](https://www.uvicorn.org/) and [gunicorn](https://gunicorn.org/).
+
+To simplify the creation of the template, and setup of the server, we will reuse the `uvicorn-gunicorn-docker` [template](https://github.com/tiangolo/uvicorn-gunicorn-docker).
+
+To build the Elastic Beanstalk image execute the following command:
+
+```bash
+docker build -t imagenet-eb -f Dockerfile  .
+```
+
+Once the build is complete, you should see output similar to below:
+
+```bash
+Removing intermediate container 91a51bb166d4
+ ---> 0bb1a7031a5e
+Successfully built 0bb1a7031a5e
+Successfully tagged imagenet-eb:latest
+```
+
+Before we can use the image in Elastic Beanstalk we also need to upload it to [AWS Elastic Container Registry (ECR)](https://aws.amazon.com/ecr/).
+
+First, navigate to the AWS ECR console and create a new repository. 
+
+Next, we will tag the image and push it to the ECR repository. Please replace the `<Region Name>`, `<Repository Name>` and `<Account ID>` placeholders with the region and name of the ECR repository and the account number of your AWS account:
+
+```
+docker tag imagenet-eb:latest <Account ID>.dkr.ecr.<Region>.amazonaws.com/<Repository Name>:latest
+docker push  <Account ID>.dkr.ecr.<Region>.amazonaws.com/<Repository Name>:latest
+```
+
+### CloudFormation
+
+Now that we have created the Docker image, the next step is to create the Elastic Beanstalk application to deploy it to. 
+
+To create this I have prepared a CloudFormation template that creates and sets up an Elastic Beanstalk application and environment with the required permissions.
+
+1. Go to: https://console.aws.amazon.com/cloudformation/home
+2. Select the region that you want to deploy to.
+3. Select 'Create Stack'->'With new resources (standard).'
+4. Select 'Upload template'.
+5. Enter the path to [deploy/elastic-beanstalk.yaml](deploy/elastic-beanstalk.yaml). Click next.
+6. Enter the required parameters for the template, in particular:
+   - Stack Name. The name of the stack. For example: 'ImageNetTestEb'. 
+   - InstanceType. The instance type to instantiate. 
+7. Click next.
+8. At the bottom of the screen, check all of the check boxes. 
+9. Click 'Create Stack'. 
+
+### API Deployment
+
+After CloudFormation has completed creating the Elastic Beanstalk application, you can deploy the API to it.
+
+Elastic Beanstalk provides two methods to deploy your application: 
+1. Upload a Zip file. You upload a zip file containing the API's files. A file named `Dockerrun.aws.json` must exist and define port mappings between the host system and Docker, but does not need to specify the Docker image URI. If a `Dockerfile` exists in the zip file the API container will be built locally without the need to upload it to ECR. 
+2. Upload `Dockerrun.aws.json` only. This file describes the Docker image path and port mappings between the host system and Docker, but needs to specify the URI of the Docker image.   
+
+For this example we will use the second approach.
+
+Create a new file called `Dockerrun.aws.json` with the content below:
+
+```json
+{
+  "AWSEBDockerrunVersion": "1",
+  "Image": {
+    "Name": "<Account ID>.dkr.ecr.<Region>.amazonaws.com/<Repository Name>:latest"
+  },
+  "Ports": [
+    {
+      "ContainerPort": "80"
+    }
+  ]
+}
+```
+
+Replace the Image URI with with the URI of the image you uploaded previously. 
+
+Go to the Elastic Beanstalk console and upload the `Dockerrun.aws.json` file using the 'Upload and deploy' button.
+
+Deployment is now complete.
+
+## Conclusion
+
+In this tutorial I have described an approach to create an API for a TensorFlow model using FastAPI. 
+
+We have also deployed the API onto two different AWS services using the same code. 
+
+Although it can sometimes be difficult to choose which AWS service to use for machine learning deployment, I'd recommend that you try AWS Lambda first because of its simplicity.
+
+ If you require a GPU for faster inference, or you have other requirements that make AWS Lambda unsuitable, then I would recommend AWS Elastic Beanstalk instead.
+
+ ## Files
+
+- [main.py](main.py) - API Source code
+- [Dockerfile](Dockerfile) - Dockerfile for Elastic Beanstalk deployment.
+- [Dockerfile.lambda](Dockerfile.lambda) - Dockerfile for Lambda deployment.
+- [Dockerrun.aws.json](Dockerrun.aws.json) - Elastic Beanstalk container configuration file.
+- [requirements.txt](requirements.txt) - Lists the requirements for the API.
+- [deploy/elastic-beanstalk.yaml](deploy/elastic-beanstalk.yaml) - Elastic Beanstalk deployment CloudFormation template.
+- [deploy/lambda.yaml](deploy/lambda.yaml) - Lambda deployment Cloudformation template.
